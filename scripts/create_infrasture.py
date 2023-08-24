@@ -85,43 +85,49 @@ def configure_s3_event(client, bucket_name, queue_arn, prefix, s3_event_name):
         )
 
 
-def cleanup_resources(sqs_client, s3_client, aws_account_id, sqs_queue_name, bucket_name):
-    # Delete the SQS queue
-    try:
-        queue_url = f"https://sqs.{aws_region}.amazonaws.com/{aws_account_id}/{sqs_queue_name}"
-        sqs_client.delete_queue(QueueUrl=queue_url)
-        print(f"Deleted SQS queue: {sqs_queue_name}")
-    except Exception as e:
-        print(f"Failed to delete SQS queue: {e}")
-
-    # Remove S3 event configurations
-    try:
-        s3_client.put_bucket_notification_configuration(
-            Bucket=bucket_name,
-            NotificationConfiguration={"QueueConfigurations": []}
-        )
-        print(f"Removed S3 event configurations from bucket: {bucket_name}")
-    except Exception as e:
-        print(f"Failed to remove S3 event configurations: {e}")
-
-    # Delete SQS policy
-    try:
-        queue_url = f"https://sqs.{aws_region}.amazonaws.com/{aws_account_id}/{sqs_queue_name}"
-        sqs_client.set_queue_attributes(
-            QueueUrl=queue_url,
-            Attributes={"Policy": ""}
-        )
-        print("Deleted SQS policy")
-    except Exception as e:
-        print(f"Failed to delete SQS policy: {e}")
-
-
 def extract_bucket_name(s3_ingestion_path):
     match = re.match(r"s3://([^/]+)/", s3_ingestion_path)
     if match:
         return match.group(1)
     else:
         raise ValueError("Invalid S3 ingestion path")
+
+
+def create_dlq(client, queue_name):
+    dlq_name = f"{queue_name}-dlq"
+    try:
+        response = client.create_queue(QueueName=dlq_name)
+        return response["QueueUrl"]
+    except client.exceptions.QueueNameExists:
+        print(f"DLQ '{dlq_name}' already exists.")
+        return client.get_queue_url(QueueName=dlq_name)["QueueUrl"]
+
+
+def configure_dlq_policy(client, dlq_arn, dlq_queue_url, aws_account_id):
+    dlq_policy = {
+        "Version": "2012-10-17",
+        "Id": "example-dlq-ID",
+        "Statement": [
+            {
+                "Sid": "example-dlq-statement-ID",
+                "Effect": "Allow",
+                "Principal": {
+                    "Service": "sqs.amazonaws.com"
+                },
+                "Action": "SQS:SendMessage",
+                "Resource": dlq_arn,
+                "Condition": {
+                    "StringEquals": {
+                        "aws:SourceAccount": aws_account_id
+                    },
+                    "ArnLike": {
+                        "aws:SourceArn": dlq_arn
+                    }
+                }
+            }
+        ]
+    }
+    client.set_queue_attributes(QueueUrl=dlq_queue_url, Attributes={"Policy": json.dumps(dlq_policy)})
 
 
 def main():
@@ -131,29 +137,53 @@ def main():
     aws_secret_key = os.getenv("DEV_SECRET_KEY")
     aws_region = os.getenv("DEV_REGION")
 
+    # ==========PAYLOAD ===============
     json_payload = {
         "s3_ingestion_path": "s3://jt-datateam-sandbox-qa-dev/raw/customers/",
-        "table_name": "customers",
-        "aws_account_id": "043916019468"
+        "table_name": "customer",
+        "aws_account_id": "XX"
     }
-
     json_payload['sqs_queue_name'] = f"{json_payload.get('table_name')}-ingestion-queue"
     json_payload['bucket'] = extract_bucket_name(json_payload['s3_ingestion_path'])
-    json_payload['s3_event_name'] = f"{json_payload.get('table_name')}-event-forward-to--{json_payload.get('sqs_queue_name')}"
+    json_payload[
+        's3_event_name'] = f"{json_payload.get('table_name')}-event-forward-to--{json_payload.get('sqs_queue_name')}"
     print(json.dumps(json_payload, indent=3))
 
+    # ==========Creating Clients ===============
     sqs_client = boto3.client('sqs', aws_access_key_id=aws_access_key, aws_secret_access_key=aws_secret_key,
                               region_name=aws_region)
     s3_client = boto3.client('s3', aws_access_key_id=aws_access_key, aws_secret_access_key=aws_secret_key,
                              region_name=aws_region)
+    # =====================================================
 
-    queue_url = create_sqs_queue(sqs_client, json_payload["sqs_queue_name"])
-    queue_arn = f"arn:aws:sqs:{os.getenv('DEV_REGION')}:{json_payload.get('aws_account_id')}:{json_payload.get('sqs_queue_name')}"
+    sqs_queue_name = json_payload.get("sqs_queue_name")
     bucket = json_payload.get("bucket")
-    time.sleep(1)
 
+    # Create the main SQS queue
+    queue_url = create_sqs_queue(sqs_client, sqs_queue_name)
+    queue_arn = f"arn:aws:sqs:{aws_region}:{json_payload['aws_account_id']}:{sqs_queue_name}"
     configure_sqs_policy(sqs_client, queue_arn, queue_url, bucket, json_payload["aws_account_id"])
-    time.sleep(1)
+
+    print(f"Queue URL: {queue_url}")
+    print(f"Queue ARN: {queue_arn}")
+
+    # Create and configure the Dead Letter Queue (DLQ)
+    dlq_queue_url = create_dlq(sqs_client, sqs_queue_name)
+    dlq_queue_arn = f"arn:aws:sqs:{aws_region}:{json_payload['aws_account_id']}:{sqs_queue_name}-dlq"
+
+    dlq_redrive_policy = {
+        "deadLetterTargetArn": dlq_queue_arn,
+        "maxReceiveCount": 1  # Adjust this as needed
+    }
+    sqs_client.set_queue_attributes(
+        QueueUrl=queue_url,
+        Attributes={
+            "RedrivePolicy": json.dumps(dlq_redrive_policy)
+        }
+    )
+
+    print(f"DLQ Queue URL: {dlq_queue_url}")
+    print(f"DLQ Queue ARN: {dlq_queue_arn}")
 
     configure_s3_event(s3_client, json_payload["bucket"], queue_arn, None, json_payload.get("s3_event_name"))
     time.sleep(1)
