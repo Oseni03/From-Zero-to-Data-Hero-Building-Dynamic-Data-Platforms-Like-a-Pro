@@ -3,6 +3,7 @@ import boto3
 import json
 from dotenv import load_dotenv
 import time
+import re
 
 load_dotenv("dev.env")
 
@@ -44,29 +45,44 @@ def configure_sqs_policy(client, queue_arn, queue_url, bucket, aws_account_id):
     client.set_queue_attributes(QueueUrl=queue_url, Attributes={"Policy": json.dumps(sqs_policy)})
 
 
-def configure_s3_event(client, bucket_name, queue_arn, prefix):
-    s3_event_configurations = [
-        {
-            "Id": "s3-event-id",
-            "Events": ["s3:ObjectCreated:*"],
-            "QueueArn": queue_arn,
-            "Filter": {
-                "Key": {
-                    "FilterRules": [
-                        {
-                            "Name": "prefix",
-                            "Value": prefix
-                        }
-                    ]
+def configure_s3_event(client, bucket_name, queue_arn, prefix, s3_event_name):
+    if prefix:
+        s3_event_configurations = [
+            {
+                "Id": s3_event_name,
+                "Events": ["s3:ObjectCreated:*"],
+                "QueueArn": queue_arn,
+                "Filter": {
+                    "Key": {
+                        "FilterRules": [
+                            {
+                                "Name": "prefix",
+                                "Value": prefix
+                            }
+                        ]
+                    }
                 }
             }
-        }
-    ]
+        ]
 
-    client.put_bucket_notification_configuration(
-        Bucket=bucket_name,
-        NotificationConfiguration={"QueueConfigurations": s3_event_configurations}
-    )
+        client.put_bucket_notification_configuration(
+            Bucket=bucket_name,
+            NotificationConfiguration={"QueueConfigurations": s3_event_configurations}
+        )
+    else:
+        s3_event_configurations = [
+            {
+                "Id": s3_event_name,
+                "Events": ["s3:ObjectCreated:*"],
+                "QueueArn": queue_arn
+
+            }
+        ]
+
+        client.put_bucket_notification_configuration(
+            Bucket=bucket_name,
+            NotificationConfiguration={"QueueConfigurations": s3_event_configurations}
+        )
 
 
 def cleanup_resources(sqs_client, s3_client, aws_account_id, sqs_queue_name, bucket_name):
@@ -100,6 +116,14 @@ def cleanup_resources(sqs_client, s3_client, aws_account_id, sqs_queue_name, buc
         print(f"Failed to delete SQS policy: {e}")
 
 
+def extract_bucket_name(s3_ingestion_path):
+    match = re.match(r"s3://([^/]+)/", s3_ingestion_path)
+    if match:
+        return match.group(1)
+    else:
+        raise ValueError("Invalid S3 ingestion path")
+
+
 def main():
     global aws_access_key, aws_secret_key, aws_region
     load_dotenv("dev.env")
@@ -108,23 +132,20 @@ def main():
     aws_region = os.getenv("DEV_REGION")
 
     json_payload = {
-        "bucket": os.getenv("BUCKET"),
-        "s3_prefix": "raw/customers/",
-        "sqs_queue_name": "customer-ingestion-s3-events",
-        "aws_account_id": "XX"
+        "s3_ingestion_path": "s3://jt-datateam-sandbox-qa-dev/raw/customers/",
+        "table_name": "customers",
+        "aws_account_id": "043916019468"
     }
+
+    json_payload['sqs_queue_name'] = f"{json_payload.get('table_name')}-ingestion-queue"
+    json_payload['bucket'] = extract_bucket_name(json_payload['s3_ingestion_path'])
+    json_payload['s3_event_name'] = f"{json_payload.get('table_name')}-event-forward-to--{json_payload.get('sqs_queue_name')}"
+    print(json.dumps(json_payload, indent=3))
 
     sqs_client = boto3.client('sqs', aws_access_key_id=aws_access_key, aws_secret_access_key=aws_secret_key,
                               region_name=aws_region)
     s3_client = boto3.client('s3', aws_access_key_id=aws_access_key, aws_secret_access_key=aws_secret_key,
                              region_name=aws_region)
-
-    # cleanup_resources(sqs_client=sqs_client,
-    #                   s3_client=s3_client,
-    #                   aws_account_id=json_payload.get("aws_account_id"),
-    #                   bucket_name=json_payload.get("bucket"),
-    #                   sqs_queue_name=json_payload.get("sqs_queue_name")
-    #                   )
 
     queue_url = create_sqs_queue(sqs_client, json_payload["sqs_queue_name"])
     queue_arn = f"arn:aws:sqs:{os.getenv('DEV_REGION')}:{json_payload.get('aws_account_id')}:{json_payload.get('sqs_queue_name')}"
@@ -134,7 +155,7 @@ def main():
     configure_sqs_policy(sqs_client, queue_arn, queue_url, bucket, json_payload["aws_account_id"])
     time.sleep(1)
 
-    configure_s3_event(s3_client, json_payload["bucket"], queue_arn, json_payload["s3_prefix"])
+    configure_s3_event(s3_client, json_payload["bucket"], queue_arn, None, json_payload.get("s3_event_name"))
     time.sleep(1)
 
 
